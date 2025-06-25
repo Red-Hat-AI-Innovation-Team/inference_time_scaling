@@ -31,14 +31,21 @@ class ParticleGibbsResult(AbstractScalingResult):
 class Particle:
     steps: list[str]
     is_stopped: bool
-    log_weight: float
+    partial_log_weights: list[float]  # Store aggregated log weights until each step
+
+    @property
+    def log_weight(self) -> float:
+        """Return the most recent log weight."""
+        if self.partial_log_weights:
+            return self.partial_log_weights[-1]
+        return 0.0
 
     def deepcopy(self):
         # create a deep copy of the particle object
         return Particle(
             steps=copy.deepcopy(self.steps),
             is_stopped=self.is_stopped,
-            log_weight=self.log_weight,
+            partial_log_weights=copy.deepcopy(self.partial_log_weights),
         )
 
 
@@ -107,7 +114,7 @@ class ParticleGibbs(AbstractScalingAlgorithm):
                 score = self.prm.score(
                     prompt, self.sg._post_process(p.steps, stopped=True)
                 )
-                p.log_weight = _inv_sigmoid(score)
+                p.partial_log_weights.append(_inv_sigmoid(score))
 
             return particles
 
@@ -159,7 +166,7 @@ class ParticleGibbs(AbstractScalingAlgorithm):
             if is_stopped:
                 continue
 
-            p.log_weight = _inv_sigmoid(scores[i])
+            p.partial_log_weights.append(_inv_sigmoid(scores[i]))
             i += 1
 
         return particles
@@ -187,28 +194,49 @@ class ParticleGibbs(AbstractScalingAlgorithm):
             num_free_particles = num_particles - len(ref_particles)
 
             particles = [
-                Particle(steps=[], is_stopped=False, log_weight=0)
+                Particle(steps=[], is_stopped=False, partial_log_weights=[])
                 for _ in range(num_free_particles)
             ] + ref_particles
 
+            current_step = 0  # Track current step outside the loop
+
             while not all(p.is_stopped for p in particles):
                 particles = self._propagate(lm, particles, prompt, batched=True)
+                current_step += 1  # Increment after propagation
 
                 # resampling (free) particles
-                log_weights = [p.log_weight for p in particles]
+                # Use partial log weights at the current step for fair comparison
+                log_weights = []
+                for p in particles:
+                    if p.is_stopped:
+                        # Stopped particles use their final weight
+                        log_weights.append(p.log_weight)
+                    else:
+                        # Non-stopped particles use weight at current step
+                        log_weights.append(p.partial_log_weights[current_step - 1])
+
                 probabilities = _softmax(log_weights)
                 resampled_particles = random.choices(
                     particles, weights=probabilities, k=num_free_particles
                 )
 
-                # add reference particles
-                particles = resampled_particles + ref_particles
-
                 if self.does_ancestor_sampling:
                     raise NotImplementedError("Ancestor sampling is not implemented")
 
-                # duplicate the particles
-                particles = [p.deepcopy() for p in particles]
+                # duplicate the resampled particles
+                resampled_particles = [p.deepcopy() for p in resampled_particles]
+
+                # Truncate reference particles if they were resampled as non-reference
+                # This ensures all particles have the same number of steps
+                for p in resampled_particles:
+                    if len(p.steps) > current_step:
+                        # This particle was a reference particle that got resampled
+                        p.steps = p.steps[:current_step]
+                        p.partial_log_weights = p.partial_log_weights[:current_step]
+                        p.is_stopped = False
+
+                # add reference particles
+                particles = resampled_particles + ref_particles
 
             # select the reference particles
             log_weights = [p.log_weight for p in particles]
